@@ -189,7 +189,7 @@ def build_check_message(status, ip):
         )
 
     lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
+        "⏰ 自动检查：每周5 18:25（北京时间）"
     )
 
     return "\n".join(lines)
