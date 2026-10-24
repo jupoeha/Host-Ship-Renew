@@ -17,7 +17,7 @@ Host-Ship 面板 (Pterodactyl) 登录页开了 Cloudflare Turnstile (siteKey 0x4
   HOSTSHIP_LOGIN      登录邮箱/用户名   必填
   HOSTSHIP_PASSWORD   登录密码         必填
   TG_BOT_TOKEN / TG_CHAT_ID           Telegram 通知 (可选)
-  IS_PROXY            true 启用代理 (浏览器 + TG/打码请求共用)
+  NODE_LINK           填写即启用代理 (浏览器 + TG/打码请求共用)，不填直连
   PROXY_SERVER        默认 socks5://127.0.0.1:1080
   MANUAL_RUN          true 时未到续期时间也发 TG 通知
   CF_TIMEOUT          自己过盾最多等待秒数, 默认 60
@@ -45,7 +45,8 @@ HOSTSHIP_PASSWORD = os.getenv("HOSTSHIP_PASSWORD", "").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-IS_PROXY = os.getenv("IS_PROXY", "false").lower() == "true"
+NODE_LINK = (os.getenv("NODE_LINK") or "").strip()
+IS_PROXY = bool(NODE_LINK)
 PROXY_SERVER = (os.getenv("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
 
 MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
