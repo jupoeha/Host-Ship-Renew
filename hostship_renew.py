@@ -1,16 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Host-Ship 免费服自动续期 (SeleniumBase UC 模式, 过 Cloudflare Turnstile)
+参照上传的 hostship_renew.py: 流程、环境变量、TG 文案保持一致。
+
+Host-Ship 面板 (Pterodactyl) 登录页开了 Cloudflare Turnstile (siteKey 0x4AAAAAACXpBx25R_J92QJ2),
+原脚本用无头 Playwright 遇到验证就放弃。这里改成 UC 模式 + 系统级真实鼠标点击过盾,
+过不去时可选打码平台拿 token, 再直接调用面板的 /auth/login 接口登录。
+
+安装:
+  apt install -y xvfb && pip install -U seleniumbase pyautogui python-xlib pysocks
+  (Linux 自动开虚拟屏; 需要 Google Chrome)
+
+环境变量:
+  SERVER_URL          服务器详情页, 如 https://panel.host-ship.com/server/abcd1234   必填
+  HOSTSHIP_LOGIN      登录邮箱/用户名   必填
+  HOSTSHIP_PASSWORD   登录密码         必填
+  TG_BOT_TOKEN / TG_CHAT_ID           Telegram 通知 (可选)
+  IS_PROXY            true 启用代理 (浏览器 + TG/打码请求共用)
+  PROXY_SERVER        默认 socks5://127.0.0.1:1080
+  MANUAL_RUN          true 时未到续期时间也发 TG 通知
+  CF_TIMEOUT          自己过盾最多等待秒数, 默认 60
+  CAPTCHA_PROVIDER    打码兜底: capsolver 或 2captcha (可选)
+  CAPTCHA_KEY         打码平台 API Key
+"""
 
 import os
 import re
 import sys
+import json
 import time
+import random
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import requests
-from playwright.sync_api import sync_playwright
-
+from seleniumbase import SB
 
 SERVER_URL = os.getenv("SERVER_URL", "").strip()
 HOSTSHIP_LOGIN = os.getenv("HOSTSHIP_LOGIN", "").strip()
@@ -20,792 +46,479 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 IS_PROXY = os.getenv("IS_PROXY", "false").lower() == "true"
-PROXY_SERVER = os.getenv(
-    "PROXY_SERVER",
-    "socks5://127.0.0.1:1080"
-).strip()
+PROXY_SERVER = (os.getenv("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
 
-MANUAL_RUN = os.getenv(
-    "MANUAL_RUN",
-    "false"
-).lower() == "true"
+MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
+CF_TIMEOUT = int(os.getenv("CF_TIMEOUT", "60"))
+CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "").strip().lower()
+CAPTCHA_KEY = os.getenv("CAPTCHA_KEY", "").strip()
 
+PANEL = "https://panel.host-ship.com"
+LOGIN_URL = PANEL + "/auth/login"
 BJ_TZ = ZoneInfo("Asia/Shanghai")
+SCHEDULE_TEXT = "每周五 15:28（北京时间）"
 
 
 def log(msg):
-    print(
-        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}",
-        flush=True
-    )
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
+
+# ======================== 网络 (支持代理) ========================
+
+def build_opener():
+    if not IS_PROXY:
+        return urllib.request.build_opener()
+    u = urllib.parse.urlparse(PROXY_SERVER)
+    if u.scheme.startswith("socks"):
+        try:
+            import socks
+            from sockshandler import SocksiPyHandler
+        except ImportError:
+            log("⚠️ 未安装 pysocks, 脚本请求将直连 (浏览器仍走代理)")
+            return urllib.request.build_opener()
+        ptype = socks.SOCKS4 if u.scheme == "socks4" else socks.SOCKS5
+        return urllib.request.build_opener(
+            SocksiPyHandler(ptype, u.hostname, u.port or 1080, True, u.username, u.password))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY_SERVER, "https": PROXY_SERVER}))
+
+
+OPENER = build_opener()
+
+
+def urlopen(req, timeout=30):
+    return OPENER.open(req, timeout=timeout)
+
+
+def http_json(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    return json.loads(urlopen(req).read().decode())
+
+
+# ======================== 文案 (同原脚本) ========================
 
 def server_id():
-    if not SERVER_URL:
-        return "未知"
-
-    return SERVER_URL.rstrip("/").split("/")[-1]
+    return SERVER_URL.rstrip("/").split("/")[-1] if SERVER_URL else "未知"
 
 
 def node_status():
-    if IS_PROXY:
-        return "✅ 已启用"
-
-    return "⚪ 未启用（直连）"
+    return "✅ 已启用" if IS_PROXY else "⚪ 未启用（直连）"
 
 
 def get_days(text):
-    if not text:
-        return None
-
-    match = re.search(
-        r"(\d+)\s*Days?",
-        text,
-        re.I
-    )
-
-    if match:
-        return int(match.group(1))
-
-    return None
+    m = re.search(r"(\d+)\s*Days?", text or "", re.I)
+    return int(m.group(1)) if m else None
 
 
 def beijing_now():
     return datetime.now(BJ_TZ)
 
 
-def estimate_renew_date(status):
+def build_check_message(status, ip):
     days = get_days(status)
+    lines = [
+        "⏳ Host-Ship 检查完成", "",
+        f"🖥️ 服务器：#{server_id()}",
+        f"🌐 节点状态：{node_status()}",
+        f"📍 出口IP：{ip}",
+        f"🕗 检查时间：{beijing_now().strftime('%Y/%m/%d %H:%M')}", "",
+        "🔒 当前状态：未到续期时间",
+    ]
+    if days is not None:
+        lines.append(f"⏱️ 距离续期：约 {days} 天")
+        lines.append("📆 预计可续期：" + (beijing_now().date() + timedelta(days=days)).strftime("%Y/%m/%d"))
+    else:
+        lines.append(f"📅 面板状态：{status}")
+    lines.append(f"⏰ 自动检查：{SCHEDULE_TEXT}")
+    return "\n".join(lines)
 
-    if days is None:
-        return None
 
-    return (
-        beijing_now().date()
-        + timedelta(days=days)
-    )
+def build_success_message(before, after, ip):
+    bd, ad = get_days(before), get_days(after)
+    return "\n".join([
+        "🎉 Host-Ship 续期成功", "",
+        f"🖥️ 服务器：#{server_id()}",
+        f"🌐 节点状态：{node_status()}",
+        f"📍 出口IP：{ip}",
+        f"🕗 续期时间：{beijing_now().strftime('%Y/%m/%d %H:%M')}", "",
+        f"📅 续期前：约 {bd} 天" if bd is not None else f"📅 续期前：{before}",
+        f"✅ 续期后：约 {ad} 天" if ad is not None else f"✅ 续期后：{after}",
+        f"⏰ 自动检查：{SCHEDULE_TEXT}",
+    ])
 
 
-def tg(text):
+def build_error_message(title, reason, ip):
+    return (f"{title}\n\n"
+            f"🖥️ 服务器：#{server_id()}\n"
+            f"🌐 节点状态：{node_status()}\n"
+            f"📍 出口IP：{ip}\n"
+            f"🕗 检查时间：{beijing_now().strftime('%Y/%m/%d %H:%M')}\n\n"
+            f"⚠️ 原因：{reason}")
+
+
+def tg(text, image_path=None):
+    """发送 TG 通知, 有截图时以图片+说明发送"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
-
     try:
-        proxies = None
-
-        if IS_PROXY:
-            proxies = {
-                "http": PROXY_SERVER,
-                "https": PROXY_SERVER,
-            }
-
-        response = requests.post(
-            (
-                "https://api.telegram.org/"
-                f"bot{TG_BOT_TOKEN}/sendMessage"
-            ),
-            json={
-                "chat_id": TG_CHAT_ID,
-                "text": text,
-            },
-            timeout=20,
-            proxies=proxies,
-        )
-
-        if response.ok:
-            log("✅ Telegram 通知发送成功")
-            return True
-
-        log(
-            "❌ Telegram 通知失败: "
-            + response.text
-        )
-
-        return False
-
+        base = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+        if image_path and os.path.exists(image_path):
+            boundary = "----hs" + str(random.randint(10**8, 10**9))
+            with open(image_path, "rb") as f:
+                img = f.read()
+            body = b""
+            for k, v in (("chat_id", TG_CHAT_ID), ("caption", text[:1024])):
+                body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+                     f'filename="{os.path.basename(image_path)}"\r\nContent-Type: image/png\r\n\r\n').encode()
+            body += img + f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(base + "/sendPhoto", data=body,
+                                         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        else:
+            req = urllib.request.Request(base + "/sendMessage",
+                                         data=json.dumps({"chat_id": TG_CHAT_ID, "text": text}).encode(),
+                                         headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=30).read()
+        log("✅ Telegram 通知发送成功")
+        return True
     except Exception as exc:
-        log(
-            f"❌ Telegram 通知异常: {exc}"
-        )
+        log(f"❌ Telegram 通知异常: {exc}")
         return False
 
 
 def current_ip():
     try:
-        proxies = None
-
-        if IS_PROXY:
-            proxies = {
-                "http": PROXY_SERVER,
-                "https": PROXY_SERVER,
-            }
-
-        response = requests.get(
-            "https://api.ipify.org",
-            timeout=15,
-            proxies=proxies,
-        )
-
-        if response.ok:
-            return response.text.strip()
-
-        return "获取失败"
-
+        return urlopen("https://api.ipify.org", timeout=15).read().decode().strip()
     except Exception:
         return "获取失败"
 
 
-def build_check_message(status, ip):
-    days = get_days(status)
-    renew_date = estimate_renew_date(status)
-    now = beijing_now()
-
-    lines = [
-        "⏳ Host-Ship 检查完成",
-        "",
-        f"🖥️ 服务器：#{server_id()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-        "🔒 当前状态：未到续期时间",
-    ]
-
-    if days is not None:
-        lines.append(
-            f"⏱️ 距离续期：约 {days} 天"
-        )
-
-    if renew_date is not None:
-        lines.append(
-            "📆 预计可续期："
-            + renew_date.strftime("%Y/%m/%d")
-        )
-
-    if days is None:
-        lines.append(
-            f"📅 面板状态：{status}"
-        )
-
-    lines.append(
-        "⏰ 自动检查：每周五 15:28（北京时间）"
-    )
-
-    return "\n".join(lines)
-
-
-def build_success_message(before, after, ip):
-    before_days = get_days(before)
-    after_days = get_days(after)
-    now = beijing_now()
-
-    lines = [
-        "🎉 Host-Ship 续期成功",
-        "",
-        f"🖥️ 服务器：#{server_id()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 续期时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-    ]
-
-    if before_days is not None:
-        lines.append(
-            f"📅 续期前：约 {before_days} 天"
-        )
-    else:
-        lines.append(
-            f"📅 续期前：{before}"
-        )
-
-    if after_days is not None:
-        lines.append(
-            f"✅ 续期后：约 {after_days} 天"
-        )
-    else:
-        lines.append(
-            f"✅ 续期后：{after}"
-        )
-
-    lines.append(
-        "⏰ 自动检查：每周五 15:28（北京时间）"
-    )
-
-    return "\n".join(lines)
-
-
-def build_error_message(title, reason, ip):
-    now = beijing_now()
-
-    return (
-        f"{title}\n\n"
-        f"🖥️ 服务器：#{server_id()}\n"
-        f"🌐 节点状态：{node_status()}\n"
-        f"📍 出口IP：{ip}\n"
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}\n\n"
-        f"⚠️ 原因：{reason}"
-    )
-
-
-def first_visible(page, selectors):
-    for selector in selectors:
-        locator = page.locator(
-            selector
-        ).first
-
-        try:
-            if (
-                locator.count()
-                and locator.is_visible()
-            ):
-                return locator
-
-        except Exception:
-            pass
-
-    return None
-
-
-def login_if_needed(page):
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
-
-    time.sleep(2)
-
-    body = page.locator(
-        "body"
-    ).inner_text().lower()
-
-    if (
-        "/server/" in page.url
-        and "password" not in body
-    ):
-        return True
-
-    email = first_visible(
-        page,
-        [
-            'input[name="email"]',
-            'input[type="email"]',
-            'input[name="username"]',
-            'input[autocomplete="username"]',
-        ],
-    )
-
-    password = first_visible(
-        page,
-        [
-            'input[name="password"]',
-            'input[type="password"]',
-            'input[autocomplete="current-password"]',
-        ],
-    )
-
-    if not email or not password:
-        log(
-            "❌ 没找到登录框，"
-            f"当前页面: {page.url}"
-        )
-        return False
-
-    if (
-        not HOSTSHIP_LOGIN
-        or not HOSTSHIP_PASSWORD
-    ):
-        log(
-            "❌ 缺少 HOSTSHIP_LOGIN "
-            "/ HOSTSHIP_PASSWORD"
-        )
-        return False
-
-    log("🔐 正在登录 Host-Ship...")
-
-    email.fill(HOSTSHIP_LOGIN)
-    password.fill(HOSTSHIP_PASSWORD)
-
-    submit = first_visible(
-        page,
-        [
-            'button[type="submit"]',
-            'button:has-text("Login")',
-            'button:has-text("Sign in")',
-            'button:has-text("Log in")',
-        ],
-    )
-
-    if not submit:
-        log("❌ 没找到登录按钮")
-        return False
-
-    submit.click()
-
-    page.wait_for_timeout(3000)
-
-    text = page.locator(
-        "body"
-    ).inner_text().lower()
-
-    challenge_words = [
-        "captcha",
-        "verify you are human",
-        "security check",
-        "cloudflare",
-    ]
-
-    if any(
-        word in text
-        for word in challenge_words
-    ):
-        log(
-            "⚠️ 检测到验证码/"
-            "安全验证，需要手动处理"
-        )
-        return False
-
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
-
-    page.wait_for_timeout(2000)
-
-    return "/server/" in page.url
-
-
-def get_renewal_text(page):
-    text = page.locator(
-        "body"
-    ).inner_text()
-
-    patterns = [
-        r"Renewal\s+in\s+\d+\s+Days?",
-        r"Renew\s+in\s+\d+\s+Days?",
-        r"\d+\s+Days?\s+until\s+renewal",
-    ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.I,
-        )
-
-        if match:
-            return match.group(0)
-
-    if re.search(
-        r"Renew\s+Limit\s+Reached",
-        text,
-        re.I,
-    ):
-        return "Renew Limit Reached"
-
-    return "未识别"
-
-
-def find_renew_button(page):
-    candidates = [
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "link",
-            name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
-                re.I,
-            ),
-        ),
-        page.locator(
-            'button:has-text("Renew")'
-        ),
-        page.locator(
-            'a:has-text("Renew")'
-        ),
-    ]
-
-    for group in candidates:
-        try:
-            count = group.count()
-
-            for i in range(count):
-                item = group.nth(i)
-
-                if item.is_visible():
-                    return item
-
-        except Exception:
-            pass
-
-    return None
-
-
-def confirm_renewal(page):
-    """Wait for the renewal dialog and click the real submit button."""
-    title = page.get_by_text(
-        re.compile(
-            r"Confirm\s+server\s+renewal",
-            re.I,
-        )
-    ).first
-
+def shot(sb, name):
     try:
-        title.wait_for(
-            state="visible",
-            timeout=8000,
-        )
+        sb.save_screenshot(name)
+        return name
     except Exception:
-        log("❌ 点击 Renew 后未出现续期确认弹窗")
-        return False
+        return None
 
-    confirm_buttons = [
-        page.get_by_role(
-            "dialog"
-        ).last.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew\s+now$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew\s+now$",
-                re.I,
-            ),
-        ),
-        page.locator(
-            'button:has-text("Renew now")'
-        ),
-    ]
 
-    for group in confirm_buttons:
+# ======================== Cloudflare Turnstile ========================
+
+JS_CF_STATE = r'''
+var t = document.title.toLowerCase();
+if (t.indexOf('just a moment') >= 0 || document.querySelector('#challenge-stage,#challenge-running')) return 'interstitial';
+var frame = [...document.querySelectorAll('iframe')].some(f => (f.src || '').indexOf('challenges.cloudflare.com') >= 0);
+var ins = document.querySelectorAll('input[name="cf-turnstile-response"]');
+if (!frame && !ins.length && !document.querySelector('.cf-turnstile,[data-sitekey]')) return 'none';
+if (!ins.length) return 'pending';
+for (var i = 0; i < ins.length; i++) { if (!ins[i].value || ins[i].value.length < 20) return 'pending'; }
+return 'ok';
+'''
+
+
+def cf_state(sb):
+    try:
+        return sb.execute_script(JS_CF_STATE)
+    except Exception:
+        return "pending"
+
+
+def solve_token_by_provider(url):
+    """打码平台拿 Turnstile token"""
+    if not CAPTCHA_PROVIDER or not CAPTCHA_KEY:
+        return ""
+    sitekey = "0x4AAAAAACXpBx25R_J92QJ2"
+    log(f"🧩 调用 {CAPTCHA_PROVIDER} 打码...")
+    if CAPTCHA_PROVIDER == "capsolver":
+        api, task = "https://api.capsolver.com", {"type": "AntiTurnstileTaskProxyLess", "websiteURL": url, "websiteKey": sitekey}
+    elif CAPTCHA_PROVIDER == "2captcha":
+        api, task = "https://api.2captcha.com", {"type": "TurnstileTaskProxyless", "websiteURL": url, "websiteKey": sitekey}
+    else:
+        log(f"⚠️ 不支持的 CAPTCHA_PROVIDER: {CAPTCHA_PROVIDER}")
+        return ""
+    created = http_json(api + "/createTask", {"clientKey": CAPTCHA_KEY, "task": task})
+    if not created.get("taskId"):
+        raise RuntimeError(f"打码创建任务失败: {created}")
+    for _ in range(40):
+        time.sleep(3)
+        r = http_json(api + "/getTaskResult", {"clientKey": CAPTCHA_KEY, "taskId": created["taskId"]})
+        if r.get("status") == "ready":
+            return (r.get("solution") or {}).get("token", "")
+        if r.get("errorId"):
+            raise RuntimeError(f"打码失败: {r}")
+    raise RuntimeError("打码超时")
+
+
+def wait_turnstile(sb, label=""):
+    """等 Turnstile 通过; 返回 True=已通过/没有盾, False=超时"""
+    start, tries, announced = time.time(), 0, False
+    while time.time() - start < CF_TIMEOUT:
+        st = cf_state(sb)
+        if st in ("none", "ok"):
+            if announced:
+                log(f"🛡️ Cloudflare 已通过 {label} ({time.time() - start:.1f}s)")
+            return True
+        if not announced:
+            log(f"🛡️ 检测到 Cloudflare {label} ({st})，处理中...")
+            announced = True
+        sb.sleep(3)
+        if cf_state(sb) in ("none", "ok"):
+            continue
+        tries += 1
         try:
-            count = group.count()
-
-            for i in range(count):
-                button = group.nth(i)
-
-                if (
-                    button.is_visible()
-                    and button.is_enabled()
-                ):
-                    log(
-                        "✅ 确认弹窗已打开，"
-                        "点击 Renew now..."
-                    )
-                    button.click()
-                    return True
-
-        except Exception:
-            pass
-
-    log("❌ 确认弹窗中未找到可点击的 Renew now")
+            log(f"   🖱️ 系统级点击验证框 (第 {tries} 次)")
+            sb.uc_gui_click_captcha()
+        except Exception as e:
+            log(f"   点击失败: {e}")
+        sb.sleep(4)
+        if tries == 3 and st == "interstitial":
+            sb.uc_open_with_reconnect(sb.get_current_url(), 6)
     return False
 
 
-def renewal_succeeded(before, after, body_text):
-    text = body_text.lower()
-    success_words = [
-        "renewed successfully",
-        "renewal successful",
-        "successfully renewed",
-        "renew limit reached",
-    ]
+# ======================== 登录 ========================
 
-    if any(word in text for word in success_words):
+def first_visible(sb, selectors):
+    for s in selectors:
+        try:
+            if sb.is_element_visible(s):
+                return s
+        except Exception:
+            pass
+    return None
+
+
+def on_login_page(sb):
+    return "/auth/login" in sb.get_current_url()
+
+
+JS_API_LOGIN = r'''
+var done = arguments[arguments.length - 1];
+var user = arguments[0], pass = arguments[1], token = arguments[2];
+function cookie(n){ var m = document.cookie.match('(^|;)\\s*' + n + '=([^;]*)'); return m ? decodeURIComponent(m[2]) : ''; }
+fetch('/sanctum/csrf-cookie', {credentials: 'include'}).then(function(){
+  return fetch('/auth/login', {
+    method: 'POST', credentials: 'include',
+    headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
+              'X-Requested-With': 'XMLHttpRequest', 'X-XSRF-TOKEN': cookie('XSRF-TOKEN')},
+    body: JSON.stringify({user: user, password: pass, 'g-recaptcha-response': token, 'cf-turnstile-response': token})
+  });
+}).then(function(r){ return r.text().then(function(t){ done(r.status + ' ' + t.slice(0, 300)); }); })
+  .catch(function(e){ done('ERR ' + e); });
+'''
+
+
+def login(sb):
+    sb.uc_open_with_reconnect(SERVER_URL, 5)
+    sb.sleep(3)
+    if "/server/" in sb.get_current_url() and not on_login_page(sb):
+        return True, ""
+
+    if not on_login_page(sb):
+        sb.uc_open_with_reconnect(LOGIN_URL, 5)
+        sb.sleep(3)
+    if cf_state(sb) == "interstitial":
+        wait_turnstile(sb, "[打开登录页]")
+
+    email = first_visible(sb, ['input[name="username"]', 'input[name="email"]', 'input[name="user"]',
+                               'input[type="email"]', 'input[autocomplete="username"]'])
+    password = first_visible(sb, ['input[name="password"]', 'input[type="password"]'])
+    if not email or not password:
+        return False, f"没找到登录框，当前页面: {sb.get_current_url()}"
+    if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
+        return False, "缺少 HOSTSHIP_LOGIN / HOSTSHIP_PASSWORD"
+
+    log("🔐 正在登录 Host-Ship...")
+    sb.type(email, HOSTSHIP_LOGIN)
+    sb.sleep(random.uniform(0.4, 1.0))
+    sb.type(password, HOSTSHIP_PASSWORD)
+    sb.sleep(random.uniform(0.4, 1.0))
+
+    if wait_turnstile(sb, "[登录]"):
+        submit = first_visible(sb, ['button[type="submit"]', 'button:contains("Login")',
+                                    'button:contains("Sign in")', 'button:contains("Log in")'])
+        if not submit:
+            return False, "没找到登录按钮"
+        sb.click(submit)
+        for _ in range(20):
+            sb.sleep(1)
+            if not on_login_page(sb):
+                break
+    else:
+        # 自己过不去: 打码拿 token, 直接调面板登录接口
+        token = solve_token_by_provider(sb.get_current_url())
+        if not token:
+            return False, "Cloudflare 验证超时 (可配置 CAPTCHA_PROVIDER / CAPTCHA_KEY 兜底)"
+        sb.driver.set_script_timeout(30)
+        res = sb.driver.execute_async_script(JS_API_LOGIN, HOSTSHIP_LOGIN, HOSTSHIP_PASSWORD, token)
+        log(f"🧩 接口登录返回: {res[:120]}")
+
+    if on_login_page(sb) or "/server/" not in sb.get_current_url():
+        sb.uc_open_with_reconnect(SERVER_URL, 4)
+        sb.sleep(3)
+    if on_login_page(sb):
+        try:
+            err = sb.get_text('[role="alert"], .text-red-500, [class*="error"]', timeout=1)
+        except Exception:
+            err = ""
+        return False, "登录失败" + (f": {err}" if err else "（账号密码错误或安全验证未通过）")
+    return "/server/" in sb.get_current_url(), ""
+
+
+# ======================== 续期 ========================
+
+def body_text(sb):
+    try:
+        return sb.get_text("body")
+    except Exception:
+        return ""
+
+
+def get_renewal_text(sb):
+    text = body_text(sb)
+    for p in (r"Renewal\s+in\s+\d+\s+Days?", r"Renew\s+in\s+\d+\s+Days?", r"\d+\s+Days?\s+until\s+renewal"):
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(0)
+    if re.search(r"Renew\s+Limit\s+Reached", text, re.I):
+        return "Renew Limit Reached"
+    return "未识别"
+
+
+RENEW_XP = ("//*[self::button or self::a][normalize-space()='Renew' or normalize-space()='Renew Now' "
+            "or normalize-space()='Renew Server' or normalize-space()='renew']")
+CONFIRM_XP = ("//*[@role='dialog' or contains(@class,'modal')]//button[normalize-space()='Renew now' "
+              "or normalize-space()='Renew Now'] | //button[normalize-space()='Renew now']")
+
+
+def find_visible(sb, xpath):
+    try:
+        for el in sb.find_elements(xpath, by="xpath"):
+            if el.is_displayed():
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def is_disabled(el):
+    try:
+        return (not el.is_enabled()) or el.get_attribute("disabled") is not None \
+            or el.get_attribute("aria-disabled") == "true"
+    except Exception:
+        return False
+
+
+def renewal_succeeded(before, after, text):
+    t = text.lower()
+    if any(w in t for w in ("renewed successfully", "renewal successful", "successfully renewed", "renew limit reached")):
         return True
-
-    before_days = get_days(before)
-    after_days = get_days(after)
-
-    return (
-        before_days is not None
-        and after_days is not None
-        and after_days > before_days
-    )
+    b, a = get_days(before), get_days(after)
+    return b is not None and a is not None and a > b
 
 
-def wait_for_renewal_result(page, before):
-    """Poll once, then reload to avoid reading a stale SPA state."""
-    after = get_renewal_text(page)
-
+def wait_for_renewal_result(sb, before):
+    after = get_renewal_text(sb)
     for attempt in range(5):
-        body_text = page.locator(
-            "body"
-        ).inner_text()
-        after = get_renewal_text(page)
-
-        if renewal_succeeded(
-            before,
-            after,
-            body_text,
-        ):
+        after = get_renewal_text(sb)
+        if renewal_succeeded(before, after, body_text(sb)):
             return True, after
-
-        page.wait_for_timeout(2000)
-
+        sb.sleep(2)
         if attempt == 1:
-            page.reload(
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            page.wait_for_timeout(2000)
-
+            sb.refresh()
+            sb.sleep(3)
     return False, after
 
 
+def run(sb, ip):
+    ok, reason = login(sb)
+    if not ok:
+        p = shot(sb, "hostship_login_fail.png")
+        tg(build_error_message("❌ Host-Ship 登录失败", reason or "登录失败或遇到安全验证", ip), p)
+        return 1
+    log("✅ 登录成功")
+    sb.sleep(3)
+
+    before = get_renewal_text(sb)
+    log(f"📅 当前续期状态：{before}")
+
+    if re.search(r"Renew\s+Limit\s+Reached", body_text(sb), re.I):
+        log("⏳ 目前未到续期时间，不进行操作")
+        if MANUAL_RUN:
+            tg(build_check_message(before, ip))
+        return 0
+
+    button = find_visible(sb, RENEW_XP)
+    if not button:
+        p = shot(sb, "hostship_no_renew_button.png")
+        tg(build_error_message("⚠️ Host-Ship 需要检查", f"没有找到可用的 Renew 按钮；{before}", ip), p)
+        return 1
+
+    if is_disabled(button):
+        log("⏳ Renew 按钮当前不可点击")
+        if MANUAL_RUN:
+            tg(build_check_message(before, ip))
+        return 0
+
+    log("🔄 已到续期窗口，点击 Renew...")
+    button.click()
+    sb.sleep(2)
+
+    # 确认弹窗 (可能也带 Turnstile)
+    if not sb.is_text_visible("Confirm server renewal") and not find_visible(sb, CONFIRM_XP):
+        sb.sleep(6)
+    if not wait_turnstile(sb, "[续期确认]"):
+        p = shot(sb, "hostship_confirm_fail.png")
+        tg(build_error_message("❌ Host-Ship 续期确认失败", "确认弹窗的 Cloudflare 验证未通过", ip), p)
+        return 1
+    confirm = find_visible(sb, CONFIRM_XP)
+    if not confirm or is_disabled(confirm):
+        p = shot(sb, "hostship_confirm_fail.png")
+        tg(build_error_message("❌ Host-Ship 续期确认失败", "点击第一层 Renew 后，未能点击确认弹窗中的 Renew now", ip), p)
+        return 1
+    log("✅ 确认弹窗已打开，点击 Renew now...")
+    confirm.click()
+    sb.sleep(3)
+
+    success, after = wait_for_renewal_result(sb, before)
+    if success:
+        log(f"✅ 续期成功：{before} -> {after}")
+        p = shot(sb, "hostship_success.png")
+        tg(build_success_message(before, after, ip), p)
+        return 0
+
+    p = shot(sb, "hostship_renew_uncertain.png")
+    log("⚠️ 已点击续期，但无法确认结果")
+    tg(build_error_message("⚠️ Host-Ship 续期结果需要检查", f"续期前：{before}；续期后：{after}", ip), p)
+    return 1
+
+
 def main():
-    if not SERVER_URL.startswith(
-        "https://panel.host-ship.com/server/"
-    ):
+    if not SERVER_URL.startswith(PANEL + "/server/"):
         log("❌ SERVER_URL 不正确")
-
-        tg(
-            "❌ Host-Ship 配置错误\n"
-            "SERVER_URL 不是服务器详情页地址"
-        )
-
+        tg("❌ Host-Ship 配置错误\nSERVER_URL 不是服务器详情页地址")
         return 1
 
     log("======================================")
     log(" Host-Ship Free Auto Renew")
     log("======================================")
-
-    log(
-        f"🌐 节点状态：{node_status()}"
-    )
-
+    log(f"🌐 节点状态：{node_status()}")
     ip = current_ip()
+    log(f"📍 当前出口IP：{ip}")
 
-    log(
-        f"📍 当前出口IP：{ip}"
-    )
+    kw = dict(uc=True, test=True, locale="en")
+    if sys.platform.startswith("linux"):
+        kw["xvfb"] = True          # 有头模式 + 虚拟屏, 过盾必需
+    if IS_PROXY and PROXY_SERVER:
+        kw["proxy"] = PROXY_SERVER
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            proxy={
-                "server": PROXY_SERVER
-            }
-            if IS_PROXY
-            else None,
-            args=[
-                "--no-sandbox"
-            ],
-        )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-        )
-
-        page = context.new_page()
-
+    with SB(**kw) as sb:
         try:
-            if not login_if_needed(page):
-                page.screenshot(
-                    path="hostship_login_fail.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 登录失败",
-                        "登录失败或遇到安全验证",
-                        ip,
-                    )
-                )
-
-                return 1
-
-            log("✅ 登录成功")
-
-            before = get_renewal_text(page)
-
-            log(
-                f"📅 当前续期状态：{before}"
-            )
-
-            body = page.locator(
-                "body"
-            ).inner_text()
-
-            if re.search(
-                r"Renew\s+Limit\s+Reached",
-                body,
-                re.I,
-            ):
-                log(
-                    "⏳ 目前未到续期时间，"
-                    "不进行操作"
-                )
-
-                if MANUAL_RUN:
-                    tg(
-                        build_check_message(
-                            before,
-                            ip,
-                        )
-                    )
-
-                return 0
-
-            button = find_renew_button(page)
-
-            if not button:
-                page.screenshot(
-                    path="hostship_no_renew_button.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "⚠️ Host-Ship 需要检查",
-                        (
-                            "没有找到可用的 "
-                            f"Renew 按钮；{before}"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
-
-            try:
-                disabled = button.is_disabled()
-
-            except Exception:
-                disabled = False
-
-            if disabled:
-                log(
-                    "⏳ Renew 按钮当前不可点击"
-                )
-
-                if MANUAL_RUN:
-                    tg(
-                        build_check_message(
-                            before,
-                            ip,
-                        )
-                    )
-
-                return 0
-
-            log(
-                "🔄 已到续期窗口，"
-                "点击 Renew..."
-            )
-
-            button.click()
-
-            if not confirm_renewal(page):
-                page.screenshot(
-                    path="hostship_confirm_fail.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 续期确认失败",
-                        (
-                            "点击第一层 Renew 后，"
-                            "未能点击确认弹窗中的 Renew now"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
-
-            success, after = wait_for_renewal_result(
-                page,
-                before,
-            )
-
-            if success:
-                log(
-                    "✅ 续期成功："
-                    f"{before} -> {after}"
-                )
-
-                tg(
-                    build_success_message(
-                        before,
-                        after,
-                        ip,
-                    )
-                )
-
-                return 0
-
-            page.screenshot(
-                path="hostship_renew_uncertain.png",
-                full_page=True,
-            )
-
-            log(
-                "⚠️ 已点击续期，"
-                "但无法确认结果"
-            )
-
-            tg(
-                build_error_message(
-                    "⚠️ Host-Ship 续期结果需要检查",
-                    (
-                        f"续期前：{before}；"
-                        f"续期后：{after}"
-                    ),
-                    ip,
-                )
-            )
-
-            return 1
-
+            return run(sb, ip)
         except Exception as exc:
-            log(
-                f"❌ 运行异常：{exc}"
-            )
-
-            try:
-                page.screenshot(
-                    path="hostship_error.png",
-                    full_page=True,
-                )
-            except Exception:
-                pass
-
-            tg(
-                build_error_message(
-                    "❌ Host-Ship 自动续期异常",
-                    str(exc),
-                    ip,
-                )
-            )
-
+            log(f"❌ 运行异常：{exc}")
+            p = shot(sb, "hostship_error.png")
+            tg(build_error_message("❌ Host-Ship 自动续期异常", str(exc), ip), p)
             return 1
-
-        finally:
-            browser.close()
 
 
 if __name__ == "__main__":
