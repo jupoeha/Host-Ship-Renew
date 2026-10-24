@@ -89,6 +89,4 @@ jobs:
             gh run delete $run_id || true
           fi
         done
-
-hostship-renew.yml
-下载
+        
