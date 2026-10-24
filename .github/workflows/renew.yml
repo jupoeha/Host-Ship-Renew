@@ -1,78 +1,91 @@
-name: Host-Ship Auto Renew
+name: Host-Ship Renew
+
+# Secrets:
+#   SERVER_URL         https://panel.host-ship.com/server/xxxx   必填
+#   HOSTSHIP_LOGIN     登录邮箱/用户名   必填
+#   HOSTSHIP_PASSWORD  登录密码         必填
+#   NODE_LINK          代理节点 vless:// vmess:// hysteria2:// socks5://   可选
+#   TG_BOT_TOKEN / TG_CHAT_ID                     可选
+#   CAPTCHA_PROVIDER (capsolver/2captcha) / CAPTCHA_KEY   可选, 过盾兜底
 
 on:
-  workflow_dispatch:
-
   schedule:
-    # 每天北京时间 08:00 自动检查
-    # GitHub cron 使用 UTC
-    # UTC 00:00 = 北京时间 08:00
-    - cron: "28 7 * * 5"
-
-permissions:
-  contents: read
+    - cron: '28 7 * * 5'   # 每周五 15:28 北京时间
+  workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v6
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+    - name: ⚙ 设置 Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright requests "requests[socks]"
-          python -m playwright install --with-deps chromium
+    - name: 🛠️ 安装依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb python3-tk python3-dev scrot jq fonts-noto-cjk
+        google-chrome --version || (wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && sudo apt-get install -y ./google-chrome-stable_current_amd64.deb)
+        pip install -U seleniumbase pyautogui python-xlib pysocks
 
-      - name: Setup optional VLESS/VMess/Trojan node
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          if [ -n "$NODE_LINK" ]; then
-            echo "NODE_LINK detected, setting up local proxy..."
+    - name: ⚙ 设置代理 (sing-box)
+      env:
+        NODE_LINK: ${{ secrets.NODE_LINK }}
+      run: |
+        if [ -z "$NODE_LINK" ]; then echo "未配置 NODE_LINK，直连运行"; exit 0; fi
+        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+    - name: 🚀 运行续期脚本
+      env:
+        SERVER_URL: ${{ secrets.SERVER_URL }}
+        HOSTSHIP_LOGIN: ${{ secrets.HOSTSHIP_LOGIN }}
+        HOSTSHIP_PASSWORD: ${{ secrets.HOSTSHIP_PASSWORD }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        CAPTCHA_PROVIDER: ${{ secrets.CAPTCHA_PROVIDER }}
+        CAPTCHA_KEY: ${{ secrets.CAPTCHA_KEY }}
+        NODE_LINK: ${{ secrets.NODE_LINK }}
+        MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+      run: python hostship_renew.py
 
-          else
-            echo "IS_PROXY=false" >> "$GITHUB_ENV"
-            echo "No NODE_LINK, direct connection will be used."
+    - name: 📸 Upload Screenshots
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: screenshots
+        path: "*.png"
+        if-no-files-found: ignore
+        retention-days: 6
+
+    - name: 🧽 清理进程和临时文件
+      if: always()
+      run: |
+        pkill -f sing-box || true
+        pkill -f chromedriver || true
+        pkill -f chrome || true
+        pkill -f Xvfb || true
+        rm -f sing-box sing-box-config.json sing-box.log
+
+    - name: 🧹 清理旧的工作流运行记录
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
           fi
-
-      - name: Run renew
-        env:
-          SERVER_URL: ${{ secrets.SERVER_URL }}
-          HOSTSHIP_LOGIN: ${{ secrets.HOSTSHIP_LOGIN }}
-          HOSTSHIP_PASSWORD: ${{ secrets.HOSTSHIP_PASSWORD }}
-
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
-          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
-
-          IS_PROXY: ${{ env.IS_PROXY }}
-          PROXY_SERVER: ${{ env.PROXY_SERVER }}
-
-        run: python hostship_renew.py
-
-      - name: Upload screenshots on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hostship-debug-screenshots
-          path: |
-            hostship_*.png
-          if-no-files-found: ignore
-
-      - name: Cleanup proxy
-        if: always()
-        run: |
-          pkill -f sing-box || true
-          rm -f sing-box sing-box-config.json sing-box.log || true
+        done
