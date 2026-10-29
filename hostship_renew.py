@@ -25,7 +25,6 @@ Host-Ship 面板 (Pterodactyl) 登录页开了 Cloudflare Turnstile (siteKey 0x4
   CAPTCHA_PROVIDER    打码兜底: capsolver 或 2captcha (可选)
   CAPTCHA_KEY         打码平台 API Key
 """
-
 import os
 import re
 import sys
