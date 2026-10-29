@@ -377,14 +377,52 @@ def body_text(sb):
 
 
 def get_renewal_text(sb):
+    # 旧代码只认 "Renewal in X Days / Renew in X Days / X Days until renewal" 三种,
+    # 面板实际文案只要是 Expires in / days left / 到期日期等, 续期前后都会是 "未识别",
+    # 哪怕 Add 3 days 点成功了也判不成。放宽到天数和日期两类, 并加兜底行。
     text = body_text(sb)
-    for p in (r"Renewal\s+in\s+\d+\s+Days?", r"Renew\s+in\s+\d+\s+Days?", r"\d+\s+Days?\s+until\s+renewal"):
-        m = re.search(p, text, re.I)
+    flat = re.sub(r"\s+", " ", text)
+    for p in (
+        r"Renewal\s+in\s+\d+\s+Days?",
+        r"Renew\s+in\s+\d+\s+Days?",
+        r"\d+\s+Days?\s+until\s+renewal",
+        r"Expires?\s+in\s+\d+\s+Days?",
+        r"Expir(?:y|ation)\s*(?:in|:)?\s*\d+\s+Days?",
+        r"\d+\s+Days?\s+(?:left|remaining)",
+        r"(?:Days?\s+left|Time\s+left|Remaining)[^0-9]{0,20}\d+\s+Days?",
+        r"Renewal[^.]{0,40}?\d{4}[-/]\d{2}[-/]\d{2}",
+        r"Expires?[^.]{0,40}?\d{4}[-/]\d{2}[-/]\d{2}",
+        r"Expiry[^.]{0,40}?\d{4}[-/]\d{2}[-/]\d{2}",
+    ):
+        m = re.search(p, flat, re.I)
         if m:
-            return m.group(0)
+            return m.group(0).strip()
     if re.search(r"Renew\s+Limit\s+Reached", text, re.I):
         return "Renew Limit Reached"
+    # 兜底: 含数字且含 renew/expir 的行 (排除纯按钮文案, 避免把 "Add 3 days" 当成剩余天数)
+    for line in text.splitlines():
+        s = line.strip()
+        if s and re.search(r"\d", s) and re.search(r"renew|expir", s, re.I) \
+                and s.lower() not in ("renew", "add 3 days", "renew now"):
+            return s[:120]
     return "未识别"
+
+
+def renewal_snippet(sb):
+    """失败诊断用: 页面上含 renew/expir 且含数字的相关行, 最多 3 行。
+
+    下次再出现未识别, TG 里直接带这段, 不用只靠 before/after 猜实际文案。
+    """
+    out = []
+    for line in body_text(sb).splitlines():
+        s = re.sub(r"\s+", " ", line).strip()
+        if s and re.search(r"\d", s) and re.search(r"renew|expir", s, re.I) \
+                and s.lower() not in ("renew", "add 3 days", "renew now"):
+            if s not in out:
+                out.append(s[:120])
+        if len(out) >= 3:
+            break
+    return "；".join(out)
 
 
 RENEW_XP = ("//*[self::button or self::a][normalize-space()='Renew' or normalize-space()='Renew Now' "
@@ -464,17 +502,35 @@ def wait_for_confirm_button(sb, timeout=None):
     return None, diag
 
 
+def _extract_date(s):
+    m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})", s or "")
+    if not m:
+        return None
+    try:
+        from datetime import date as _date
+        return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+
 def renewal_succeeded(before, after, text):
     t = text.lower()
-    if any(w in t for w in ("renewed successfully", "renewal successful", "successfully renewed", "renew limit reached")):
+    if any(w in t for w in ("renewed successfully", "renewal successful", "successfully renewed",
+                            "renew limit reached", "server renewed", "renewal complete",
+                            "successfully extended", "days added", "added 3 days",
+                            "extension successful", "renewed for")):
         return True
     b, a = get_days(before), get_days(after)
-    return b is not None and a is not None and a > b
+    if b is not None and a is not None and a > b:
+        return True
+    # 到期日期型文案: 日期变晚也算成功
+    db, da = _extract_date(before), _extract_date(after)
+    return db is not None and da is not None and da > db
 
 
 def wait_for_renewal_result(sb, before):
     after = get_renewal_text(sb)
-    for attempt in range(5):
+    for attempt in range(8):
         after = get_renewal_text(sb)
         if renewal_succeeded(before, after, body_text(sb)):
             return True, after
@@ -555,7 +611,11 @@ def run(sb, ip):
 
     p = shot(sb, "hostship_renew_uncertain.png")
     log("⚠️ 已点击续期，但无法确认结果")
-    tg(build_error_message("⚠️ Host-Ship 续期结果需要检查", f"续期前：{before}；续期后：{after}", ip), p)
+    snippet = renewal_snippet(sb)
+    reason = f"续期前：{before}；续期后：{after}"
+    if snippet:
+        reason += f"；页面相关文案：{snippet}"
+    tg(build_error_message("⚠️ Host-Ship 续期结果需要检查", reason, ip), p)
     return 1
 
 
