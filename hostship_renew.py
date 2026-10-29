@@ -392,12 +392,17 @@ RENEW_XP = ("//*[self::button or self::a][normalize-space()='Renew' or normalize
 # 确认按钮按优先级匹配: 弹窗内精确 -> 全局精确 -> 弹窗内 Renew/Confirm 包含
 # 旧代码只查一次、且按钮一开始是 disabled 就直接判失败, 弹窗慢 / 按钮先禁后放
 # / 文案不是精确 "Renew now" 时都会走到 "未能点击确认弹窗"。
+# 实测诊断证明: 点第一层 Renew 后页面并没有 Renew now, 弹窗尾部出现的是
+# Cancel / Add 3 days, 所以 Add 3 days 才是这个面板真正的确认按钮, 放最前面。
 CONFIRM_XPS = [
+    "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][normalize-space()='Add 3 days']",
+    "//*[self::button or self::a][normalize-space()='Add 3 days']",
     "//*[@role='dialog' or contains(@class,'modal')]//button[normalize-space()='Renew now' or normalize-space()='Renew Now']",
     "//button[normalize-space()='Renew now' or normalize-space()='Renew Now']",
     "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][normalize-space()='Renew now' or normalize-space()='Renew Now']",
     "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][contains(normalize-space(),'Renew')]",
     "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][contains(normalize-space(),'Confirm')]",
+    "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][contains(normalize-space(),'Add')]",
 ]
 
 
@@ -420,12 +425,17 @@ def is_disabled(el):
 
 
 def visible_buttons_text(sb):
-    """失败诊断用: 当前页面所有可见按钮/a 的文案, 下次失败时就知道弹窗按钮到底叫什么。"""
+    """失败诊断用: 当前页面所有可见按钮/a 的文案, 下次失败时就知道弹窗按钮到底叫什么。
+
+    只取每个元素的首行并截断到 40 字: 卡片式 <a> 的 innerText 会带整段广告文案,
+    不截断会把 TG 诊断撑爆 (上次 Premium 卡片整段都进来了)。
+    """
     try:
         return sb.execute_script(
             "return [...document.querySelectorAll('button,a')]"
             ".filter(e=>e.offsetParent!==null)"
-            ".map(e=>(e.innerText||'').trim()).filter(Boolean).slice(0,40);")
+            ".map(e=>((e.innerText||'').trim().split('\\n')[0]||'').trim().slice(0,40))"
+            ".filter(Boolean).slice(0,40);")
     except Exception:
         return []
 
@@ -450,7 +460,7 @@ def wait_for_confirm_button(sb, timeout=None):
     diag = "按钮出现过但一直不可点击" if saw_disabled else "超时内没出现确认按钮"
     btns = visible_buttons_text(sb)
     if btns:
-        diag += "；页面可见按钮：" + " / ".join(btns)
+        diag += "；页面可见按钮：" + " / ".join(btns[:25])
     return None, diag
 
 
@@ -523,7 +533,7 @@ def run(sb, ip):
         tg(build_error_message("❌ Host-Ship 续期确认失败",
                                f"点击第一层 Renew 后，未能点击确认弹窗中的 Renew now；{diag}", ip), p)
         return 1
-    log("✅ 确认弹窗已打开，点击 Renew now...")
+    log("✅ 确认弹窗已打开，点击确认按钮...")
     try:
         confirm.click()
     except Exception:
