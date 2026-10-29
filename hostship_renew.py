@@ -21,6 +21,7 @@ Host-Ship 面板 (Pterodactyl) 登录页开了 Cloudflare Turnstile (siteKey 0x4
   PROXY_SERVER        默认 socks5://127.0.0.1:1080
   MANUAL_RUN          true 时未到续期时间也发 TG 通知
   CF_TIMEOUT          自己过盾最多等待秒数, 默认 60
+  CONFIRM_TIMEOUT     等确认弹窗按钮出现并可点击的最多秒数, 默认 30
   CAPTCHA_PROVIDER    打码兜底: capsolver 或 2captcha (可选)
   CAPTCHA_KEY         打码平台 API Key
 """
@@ -51,6 +52,7 @@ PROXY_SERVER = (os.getenv("PROXY_SERVER") or "socks5://127.0.0.1:1080").strip()
 
 MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
 CF_TIMEOUT = int(os.getenv("CF_TIMEOUT", "60"))
+CONFIRM_TIMEOUT = int(os.getenv("CONFIRM_TIMEOUT", "30"))
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "").strip().lower()
 CAPTCHA_KEY = os.getenv("CAPTCHA_KEY", "").strip()
 
@@ -387,8 +389,16 @@ def get_renewal_text(sb):
 
 RENEW_XP = ("//*[self::button or self::a][normalize-space()='Renew' or normalize-space()='Renew Now' "
             "or normalize-space()='Renew Server' or normalize-space()='renew']")
-CONFIRM_XP = ("//*[@role='dialog' or contains(@class,'modal')]//button[normalize-space()='Renew now' "
-              "or normalize-space()='Renew Now'] | //button[normalize-space()='Renew now']")
+# 确认按钮按优先级匹配: 弹窗内精确 -> 全局精确 -> 弹窗内 Renew/Confirm 包含
+# 旧代码只查一次、且按钮一开始是 disabled 就直接判失败, 弹窗慢 / 按钮先禁后放
+# / 文案不是精确 "Renew now" 时都会走到 "未能点击确认弹窗"。
+CONFIRM_XPS = [
+    "//*[@role='dialog' or contains(@class,'modal')]//button[normalize-space()='Renew now' or normalize-space()='Renew Now']",
+    "//button[normalize-space()='Renew now' or normalize-space()='Renew Now']",
+    "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][normalize-space()='Renew now' or normalize-space()='Renew Now']",
+    "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][contains(normalize-space(),'Renew')]",
+    "//*[@role='dialog' or contains(@class,'modal')]//*[self::button or self::a][contains(normalize-space(),'Confirm')]",
+]
 
 
 def find_visible(sb, xpath):
@@ -407,6 +417,41 @@ def is_disabled(el):
             or el.get_attribute("aria-disabled") == "true"
     except Exception:
         return False
+
+
+def visible_buttons_text(sb):
+    """失败诊断用: 当前页面所有可见按钮/a 的文案, 下次失败时就知道弹窗按钮到底叫什么。"""
+    try:
+        return sb.execute_script(
+            "return [...document.querySelectorAll('button,a')]"
+            ".filter(e=>e.offsetParent!==null)"
+            ".map(e=>(e.innerText||'').trim()).filter(Boolean).slice(0,40);")
+    except Exception:
+        return []
+
+
+def wait_for_confirm_button(sb, timeout=None):
+    """轮询等确认按钮出现且可点击。
+
+    返回 (元素或 None, 诊断信息): 按钮出现过但一直 disabled、或一直没出现,
+    都等满 timeout 才判失败, 不再像旧代码那样只查一次就报错。
+    """
+    timeout = CONFIRM_TIMEOUT if timeout is None else timeout
+    deadline, saw_disabled = time.time() + timeout, False
+    while time.time() < deadline:
+        for xp in CONFIRM_XPS:
+            el = find_visible(sb, xp)
+            if el:
+                if is_disabled(el):
+                    saw_disabled = True
+                    break
+                return el, ""
+        sb.sleep(1)
+    diag = "按钮出现过但一直不可点击" if saw_disabled else "超时内没出现确认按钮"
+    btns = visible_buttons_text(sb)
+    if btns:
+        diag += "；页面可见按钮：" + " / ".join(btns)
+    return None, diag
 
 
 def renewal_succeeded(before, after, text):
@@ -462,22 +507,33 @@ def run(sb, ip):
 
     log("🔄 已到续期窗口，点击 Renew...")
     button.click()
-    sb.sleep(2)
 
-    # 确认弹窗 (可能也带 Turnstile)
-    if not sb.is_text_visible("Confirm server renewal") and not find_visible(sb, CONFIRM_XP):
-        sb.sleep(6)
-    if not wait_turnstile(sb, "[续期确认]"):
+    # 确认弹窗 (可能也带 Turnstile): 先轮询等弹窗+按钮可用, 再过盾, 过盾后再等一次
+    # (盾可能让按钮先禁后放; 旧代码只查一次, 弹窗慢或按钮先 disabled 就直接报失败)
+    confirm, diag = wait_for_confirm_button(sb)
+    if not confirm and cf_state(sb) not in ("none", "ok"):
+        if not wait_turnstile(sb, "[续期确认]"):
+            p = shot(sb, "hostship_confirm_fail.png")
+            tg(build_error_message("❌ Host-Ship 续期确认失败", "确认弹窗的 Cloudflare 验证未通过", ip), p)
+            return 1
+        confirm, diag = wait_for_confirm_button(sb, timeout=15)
+    if not confirm:
+        log(f"❌ 确认弹窗失败: {diag}")
         p = shot(sb, "hostship_confirm_fail.png")
-        tg(build_error_message("❌ Host-Ship 续期确认失败", "确认弹窗的 Cloudflare 验证未通过", ip), p)
-        return 1
-    confirm = find_visible(sb, CONFIRM_XP)
-    if not confirm or is_disabled(confirm):
-        p = shot(sb, "hostship_confirm_fail.png")
-        tg(build_error_message("❌ Host-Ship 续期确认失败", "点击第一层 Renew 后，未能点击确认弹窗中的 Renew now", ip), p)
+        tg(build_error_message("❌ Host-Ship 续期确认失败",
+                               f"点击第一层 Renew 后，未能点击确认弹窗中的 Renew now；{diag}", ip), p)
         return 1
     log("✅ 确认弹窗已打开，点击 Renew now...")
-    confirm.click()
+    try:
+        confirm.click()
+    except Exception:
+        # 元素被遮挡等导致普通点击失败时, 用 JS 点击兜底
+        try:
+            sb.execute_script("arguments[0].click();", confirm)
+        except Exception as e:
+            p = shot(sb, "hostship_confirm_fail.png")
+            tg(build_error_message("❌ Host-Ship 续期确认失败", f"确认按钮已找到但点击失败: {e}", ip), p)
+            return 1
     sb.sleep(3)
 
     success, after = wait_for_renewal_result(sb, before)
